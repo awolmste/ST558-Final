@@ -1,0 +1,649 @@
+---
+title: "DiBartolomeis et al 2019 Analysis"
+author: "Allen Olmstead"
+date: "November 22, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(pdftools)
+library(stringr)
+library(readxl)
+library(maps)
+#library(socviz)
+library(rvest)
+library(httr)
+library(jsonlite)
+library(tidyverse)
+```
+
+Data for AITL (Acute Insecticide Toxicity Loading) came from the supplemental material of:  
+DiBartolomeis M, Kegley S, Mineau P, Radford R, Klein K. 2019. An assessment of acute insecticide toxicity loading (AITL) of chemical pesticides used on agricultural land in the United States. PLoS ONE 14(8): e0220029 [link](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0220029)
+
+```{r}
+# read in DiBartolomeis et al 2019 supplemental pdf file
+file1 <- "./Ecotox data files/pone.0220029.s001.pdf"
+
+# function to start pdf page processing
+import_pdf_step1 <- function(x, page) {
+  pdf_text(x)[page] %>% 
+  str_split("\n", simplify = TRUE) %>% 
+  as.vector() %>% 
+  enframe(name = NULL) %>% 
+  filter(str_detect(value, "^\\w"))
+}
+
+# Column names for pdf table
+s1_col_names <- c("pesticide", "half_life", "study_type", "citation1", "contact_ld50",
+                  "oral_ld50", "citation2")
+
+# read in first page of pdf file
+s1_app_1 <- import_pdf_step1(file1, 1)  %>% 
+  .[2:20, ] %>% 
+  separate(value, 
+           into = s1_col_names,
+           sep = c(30, 40, 52, 65, 80, 88, 100))
+
+# read in second page of pdf file
+s1_app_2 <- import_pdf_step1(file1, 2)  %>% 
+  separate(value, 
+           into = s1_col_names,
+           sep = c(25, 35, 48, 55, 65, 75, 100))
+
+# read in third page of pdf file
+s1_app_3 <- import_pdf_step1(file1, 3)  %>% 
+  separate(value, 
+           into = s1_col_names,
+           sep = c(25, 30, 48, 55, 65, 72, 100))
+# Note that Methiocarb values are missing
+s1_app_3[startsWith(s1_app_3$pesticide, "Methio"), c(2, 5, 6)] <- c(35, 0.30, 0.47)
+
+# read in fourth page of pdf file
+s1_app_4 <- import_pdf_step1(file1, 4)  %>% 
+  .[1:18, ] %>% 
+  separate(value, 
+           into = s1_col_names,
+           sep = c(29, 42, 65, 75, 85, 100, 110))
+# Note that Spinetoram values are missing
+s1_app_4[startsWith(s1_app_4$pesticide, "Spine"), c(1:3, 5, 6)] <- 
+  c("Spinetoram", 16.1, "EU Soil", 0.026, 0.082)
+# Rename Spinosad
+s1_app_4[startsWith(s1_app_4$pesticide, "Spinosad"), 1] <- "Spinosad"
+
+# bind all pdf pages together and process data table
+s1_app <- bind_rows(s1_app_1, s1_app_2, s1_app_3, s1_app_4) %>% 
+  select(-citation1, -citation2) %>% 
+  mutate_all(str_trim) %>% 
+  mutate_at(vars(half_life, contact_ld50, oral_ld50), as.numeric) %>% 
+  filter(pesticide != "L)")
+```
+
+Estimated annual agricultural pesticide use in the United States came for the Pesticide National Synthesis Project [link](https://water.usgs.gov/nawqa/pnsp/usage/maps/about.php) from the USGS. 
+
+```{r, epest, message = FALSE}
+# read in USGS EPest data
+setwd("./USGS data files")
+epest <- list.files(pattern = "EPest.county.estimates.*.txt") %>% 
+  lapply(read_tsv) %>% 
+  bind_rows() %>% 
+  mutate(COMPOUND = str_to_title(COMPOUND),
+         state = state.fips$polyname[match(as.numeric(STATE_FIPS_CODE), state.fips$fips)]) %>% 
+  separate(state, into = c("state", "other"), sep = ":") %>% 
+  select(-other)
+  
+colnames(epest) <- str_to_lower(colnames(epest))
+
+# Correct some pesticide names
+epest[epest$compound == "Bladprotein", "compound"] <- "Blad Protein"
+epest[epest$compound == "Fluvalinate Tau", "compound"] <- "Fluvalinate-Tau"
+epest[epest$compound == "Copper Sulf Tribasic", "compound"] <- "Copper Sulfate Tribasic"
+epest[epest$compound == "Potassiumsilicate", "compound"] <- "Potassium Silicate"
+
+# Summarize EPest at the State Level
+epest_state <- epest %>%
+  group_by(compound, year, state) %>% 
+  summarise(epest_low_kg = sum(epest_low_kg, na.rm = TRUE),
+            epest_high_kg = sum(epest_high_kg, na.rm = TRUE))
+
+# Summarize EPest at the national level
+epest_nation <- epest_state %>% 
+  group_by(compound, year) %>% 
+  summarize(epest_low_kg = sum(epest_low_kg, na.rm = TRUE),
+            epest_high_kg = sum(epest_high_kg, na.rm = TRUE))
+
+write.csv(epest_state, "epest_state.csv")
+```
+
+Mode of action information for insecticides was obtained from the Insecticide Resistance Action Committee [link](https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=2&ved=2ahUKEwi06MSLr5PmAhXo1FkKHaJRDx0QFjABegQIARAC&url=https%3A%2F%2Fwww.irac-online.org%2Fdocuments%2Fmoa-classification%2F&usg=AOvVaw3RUw6h_AeroMUm-sko9uGy)
+
+```{r, irac_class}
+# read in irac pdf file
+file_irac <- "./Pesticide Class/_MoA-Classification_v9.3_13June19.pdf"
+
+# function to import pdf pages
+import_pdf <- function(x, page, rows, into, sep) {
+  pdf_text(x)[page] %>% 
+  str_split("\n", simplify = TRUE) %>% 
+  as.vector() %>% 
+  enframe(name = NULL) %>% 
+  .[rows, ] %>% 
+  separate(value, into = into, sep = sep)
+}
+
+# column names for irac table
+irac_col_names <- c("compound1", "irac1", "compound2", "irac2")
+
+# first page of irac table
+irac_1 <- import_pdf(file_irac, 26, 10:66, irac_col_names, c(50, 60, 110, 210))
+# Fix some entries that got split
+irac_1[startsWith(irac_1$compound1, "Bioallethrin"), 2] <- "3A"
+irac_1[startsWith(str_trim(irac_1$compound2), "Chenopodium"), 3:4] <- 
+  c("Chenopodium ambrosioides extract", "UNE")  
+
+# second page of irac table
+irac_2 <- import_pdf(file_irac, 27, 5:47, irac_col_names, c(49, 60, 110, 210))
+# Fix some split entries
+irac_2[startsWith(str_trim(irac_2$compound1), "Fatty"), 1:4] <- 
+  c("Fatty acid monoesters with glycerol or propanediol", "UNE",
+    "Isopropyl )-(methoxyaminothiophosphoryl) salicylate", "1B")
+
+# third page of irac table
+irac_3 <- import_pdf(file_irac, 28, 5:52, irac_col_names, c(48, 60, 110, 210))
+# Fix a split entry
+irac_3[startsWith(str_trim(irac_3$compound1), "Paecilomyces"), 2] <- "UNF"
+
+# fourth page of irac table
+irac_4 <- import_pdf(file_irac, 29, 5:24, irac_col_names, c(48, 60, 110, 210))
+
+# create irac dataset and process
+irac <- bind_rows(irac_1[, 3:4], irac_2[, 3:4], irac_3[, 3:4], irac_4[, 3:4]) %>% 
+  rename(compound1 = compound2, irac1 = irac2) %>% 
+  bind_rows(irac_1[, 1:2], irac_2[, 1:2], irac_3[, 1:2], irac_4[, 1:2]) %>% 
+  mutate_all(str_trim) %>% 
+  rename(compound = compound1, irac = irac1) %>% 
+  filter(compound != "" & irac != "") %>% 
+  mutate(insecticide = TRUE,
+         compound = str_to_title(compound)) %>% 
+  arrange(compound)
+
+# rename select pesticides to match USGS epest names
+irac[irac$compound == "Alpha-Cypermethrin", "compound"] <- "Alpha Cypermethrin"
+irac[irac$compound == "Aluminium Phosphide", "compound"] <- "Aluminum Phosphide"
+irac[irac$compound == "Beauveria Bassiana Strains", "compound"] <- "Beauveria Bassiana"
+irac[irac$compound == "Burkholderia Spp,", "compound"] <- "Burkholderia Spp"
+irac[irac$compound == "Chenopodium Ambrosioides Extract", "compound"] <- 
+  "Chenopodium Ambrosioides"
+irac[irac$compound == "Demeton-S-Methyl", "compound"] <- "Demeton"
+irac[irac$compound == "Emamectin Benzoate", "compound"] <- "Emamectin"
+irac[irac$compound == "Flubendimide", "compound"] <- "Flubendiamide"
+irac[irac$compound == "Pyrethrins (Pyrethrum)", "compound"] <- "Pyrethrins"
+```
+
+Mode of action information for fungicides was obtained from the Fungicide Resistance Action Committee [link](http://ipm.ifas.ufl.edu/resources/success_stories/T&PGuide/pdfs/Appendices/Appendix6-FRAC.pdf)
+
+```{r, frac_class}
+# read in frac pdf files
+file_frac <- "./Pesticide Class/Appendix6-FRAC.pdf"
+
+# column names for frac table
+frac_col_names <- c("frac", "target", "group_name", "chem_group", "compound", "comments")
+
+# process pdf pages
+frac_1 <- import_pdf(file_frac, 3, 5:67, frac_col_names, c(5, 25, 43, 57, 78, 160))
+frac_2 <- import_pdf(file_frac, 4, 4:62, frac_col_names, c(5, 25, 42, 58, 77, 160))
+frac_3 <- import_pdf(file_frac, 5, 4:79, frac_col_names, c(4, 24, 42, 62, 82, 160))
+frac_4 <- import_pdf(file_frac, 6, 4:71, frac_col_names, c(4, 24, 42, 62, 82, 160))
+frac_5 <- import_pdf(file_frac, 7, 4:43, frac_col_names, c(4, 24, 42, 62, 85, 160))
+
+# create frac list of compounds
+frac <- bind_rows(frac_1, frac_2, frac_3, frac_4, frac_5) %>% 
+  mutate_all(str_trim) %>%
+  select(compound) %>% 
+  filter(compound != "" & !compound %in% c("salts", "(Bactericide)", "(also antibacterial and",
+                                           "antifungal activity)"))
+# rename a couple of problematic rows
+frac[startsWith(frac$compound, "(=mefenoxam"), 1] <- "mefenoxam"
+frac[startsWith(frac$compound, "phophorous acid"), 1] <- "phosphorous acid and salts"
+
+# create tibble with just the irac codes
+frac_code <- tibble(frac = as.character(c(rep(1, 6), rep(2, 4), rep(3, 34), rep(4, 7), rep(5, 7),
+                             rep(6, 4), rep(7, 10), rep(8, 3), rep(9, 3), 10, rep(11, 12),
+                             12, 12, 13, rep(14, 7), rep(16.1, 3), rep(16.2, 3), 17,
+                             rep(18, 3), 19, 20:27, rep(28, 3), rep(29, 4), rep(30, 3), 31,
+                             32, 32, 33, 33:39, rep(40, 5), 41, 42, rep("P", 3))))
+
+# create tibble with just the fungicide group names
+fung_group <- tibble(fungicide_group = c(rep("benzimidazoles", 4), rep("thiophanates", 2),
+                                         rep("dicarboximides", 4), rep("imidazoles", 5),
+                                         "piperazines", "pyridines", rep("pyrimidines", 2),
+                                         rep("trizaoles", 25), rep("acylalanines", 5),
+                                         "oxazolidinones", "butyrolactones",
+                                         rep("morpholines", 4), rep("piperidines", 2),
+                                         "spiroketalamines", rep("phosphorothiolates", 3),
+                                         "dithiolanes", rep("carboxamides", 10),
+                                         rep("hydroxy-(2-amino-)pyrimidines", 3),
+                                         rep("anilinopyrimidines", 3), "n-phenylcarbamates",
+                                         rep("methoxyacrylates", 3), "methoxycarbamates",
+                                         rep("oximino acetates", 2),
+                                         rep("oximino acetamides", 3), "oxazolidine-diones",
+                                         "dihydro-dioxaines", "imidazolinones",
+                                         rep("phenylpyrroles", 2), "quinolones",
+                                         rep("aromatic hydrocarbons", 6), "heteroaromatics",
+                                         "isobenzofuranone", "pyrroloquinolinone", 
+                                         "thiazolobenzothiazole", "cyclopropanecarboxamide",
+                                         "carboxamide", "propionamide", "hydroxyanilides",
+                                         "thiocarbamates", rep("allylamines", 2),
+                                         "peptidyl pyrimidine nucleoside", "phenylureas",
+                                         "cyanoimidazole", "benzamides",
+                                         "enopyranuronic acid antibiotic",
+                                         "hexopyranosyl antibiotic",
+                                         rep("glucopyranosyl antibiotic",2),
+                                         "cyanoacetamide-oximes", rep("carbamates", 3),
+                                         rep("dinitrophenyl crotonates", 2), 
+                                         "primidinonehydrazones", "2,6-dinitroanilines",
+                                         rep("tri phenyl tin compounds", 3), "carboxylic acids",
+                                         rep("heteroaromatics", 2), "ethyl phosphonates", 
+                                         "phosphonates", "phthalamic acids", "benzotriazines",
+                                         "benzenesulfonamides", "pyridazinones",
+                                         "thiophenecarboxamides", "pyrimidinamides",
+                                         rep("cinnamic acid", 2), 
+                                         rep("valinamide carbamates", 2), "mandelic acid amides",
+                                         "tetracycline antibiotic", "thiocarbamate",
+                                         "benzo-thiadiazole", "benzisothiazole",
+                                         "thiadiazolecarboxamide"))
+
+# create frac data set by binding frac codes, chemical groups and compound names
+frac <- bind_cols(frac_code, fung_group, frac) %>% 
+  mutate(compound = str_to_title(compound),
+         fungicide = TRUE)
+
+# rename select pesticides to match USGS epest names
+frac[frac$compound == "Acibenzolar-S-Methyl", "compound"] <- "Acibenzolar"
+frac[frac$compound == "Fosetyl-Al", "compound"] <- "Fosetyl"
+frac[frac$compound == "Hymexazole", "compound"] <- "Hymexazol"
+frac[frac$compound == "Propamocarb", "compound"] <- "Propamocarb Hcl"
+frac[frac$compound == "Quintozene (Pcnb)", "compound"] <- "Quintozene"
+```
+
+Mode of action information for herbicides was obtained from the Herbicide Resistance Action Committee [link](http://www.weedscience.org/Documents/ShowDocuments.aspx?DocumentID=1193)
+
+```{r, hrac}
+# read in frac pdf files
+file_hrac <- "./Pesticide Class/WeedScienceCom.pdf"
+
+# column names for hrac table
+hrac_col_names <- c("hrac", "site_of_action", "herbicide_group", "compound", "wssa_group")
+
+# read in hrac pdf pages
+hrac_1 <- import_pdf(file_hrac, 1, 28:83, hrac_col_names, c(25, 65, 110, 155, 170))
+hrac_2 <- import_pdf(file_hrac, 2, 2:85, hrac_col_names, c(15, 56, 82, 104, 170))
+# fix a split entry
+hrac_2[startsWith(str_trim(hrac_2$herbicide_group), "Sulfonylamino"), 3] <-
+  "Sulfonylaminocarbonyltriazolinone"
+hrac_2[startsWith(str_trim(hrac_2$herbicide_group), "triazolinone"), 3] <- NA
+hrac_3 <- import_pdf(file_hrac, 3, 2:71, hrac_col_names, c(15, 69, 90, 115, 170))
+hrac_4 <- import_pdf(file_hrac, 4, 2:77, hrac_col_names, c(15, 74, 99, 129, 170))
+hrac_5 <- import_pdf(file_hrac, 5, 2:20, hrac_col_names, c(15, 74, 99, 120, 170))
+# add a classification for WSSA for the last group
+hrac_5[str_trim(hrac_5$compound) == "bromobutide", 5] <- 27
+
+# create hrac dataset of compounds
+hrac <- bind_rows(hrac_1, hrac_2, hrac_3, hrac_4, hrac_5) %>% 
+  mutate_all(str_trim) %>% 
+  select(-site_of_action) %>% 
+  filter(hrac != "Group" & hrac != "HRAC") %>% 
+  mutate(hrac = ifelse(lead(hrac) != "", lead(hrac), NA),
+         wssa_group = ifelse(lead(wssa_group) != "", lead(wssa_group), NA),
+         herbicide_group = ifelse(herbicide_group %in% c("", "\u2018FOPs\u2019", 
+                                                         "\u2018DIMs\u2019"),
+                                  NA, herbicide_group)) %>% 
+  fill(hrac, wssa_group, herbicide_group) %>% 
+  filter(compound != "" & !compound %in% c("...", "(in vivo inhibition of", "lycopene cyclase)",
+                                           "(also group O)", "(also group L)")) %>% 
+  mutate(compound = str_to_title(compound),
+         herbicide = TRUE)
+
+# rename select pesticides to match USGS epest names
+hrac[hrac$compound == "Acifluorfen-Na", "compound"] <- "Acifluorfen"
+hrac[hrac$compound == "Ametryne", "compound"] <- "Ametryn"
+hrac[hrac$compound == "Benefin = Benfluralin", "compound"] <- "Benfluralin"
+hrac[hrac$compound == "Bensulfuron-Methyl", "compound"] <- "Bensulfuron"
+hrac[hrac$compound == "Bentazon", "compound"] <- "Bentazone"
+hrac[hrac$compound == "Bispyribac-Na", "compound"] <- "Bispyribac"
+hrac[hrac$compound == "Clodinafop-Propargyl", "compound"] <- "Clodinafop"
+hrac[hrac$compound == "Cyhalofop-Butyl", "compound"] <- "Cyhalofop"
+hrac[hrac$compound == "Dcpa = Chlorthal-Dimethyl", "compound"] <- "Dcpa"
+hrac[hrac$compound == "Dichlorprop = 2,4-Dp", "compound"] <- "Dichlorprop"
+hrac[hrac$compound == "Diclofop-Methyl", "compound"] <- "Diclofop"
+hrac[hrac$compound == "Diflufenzopyr-Na", "compound"] <- "Diflufenzopyr"
+hrac[hrac$compound == "Dimethanamid", "compound"] <- "Dimethenamid"
+hrac[hrac$compound == "Ethametsulfuron-Methyl", "compound"] <- "Ethametsulfuron"
+hrac[hrac$compound == "Fenoxaprop-P-Ethyl", "compound"] <- "Fenoxaprop"
+hrac[hrac$compound == "Fluazifop-P-Butyl", "compound"] <- "Fluazifop"
+hrac[hrac$compound == "Flucarbazone-Na", "compound"] <- "Flucarbazone"
+hrac[hrac$compound == "Flumiclorac-Pentyl", "compound"] <- "Flumiclorac"
+hrac[hrac$compound == "Glufosinate-Ammonium", "compound"] <- "Glufosinate"
+hrac[hrac$compound == "Halosulfuron-Methyl", "compound"] <- "Halosulfuron"
+hrac[hrac$compound == "Imazamethabenz-Methyl", "compound"] <- "Imazamethabenz"
+hrac[hrac$compound == "Mecoprop = Mcpp = Cmpp", "compound"] <- "Mecoprop"
+hrac[hrac$compound == "Metam", "compound"] <- "Metam Potassium"
+hrac[hrac$compound == "Metsulfuron-Methyl", "compound"] <- "Metsulfuron"
+hrac[hrac$compound == "Primisulfuron-Methyl", "compound"] <- "Primisulfuron"
+hrac[hrac$compound == "Prometryne", "compound"] <- "Prometryn"
+hrac[hrac$compound == "Propoxycarbazone-Na", "compound"] <- "Propoxycarbazone"
+hrac[hrac$compound == "Propyzamide = Pronamide", "compound"] <- "Propyzamide"
+hrac[hrac$compound == "Pyraflufen-Ethyl", "compound"] <- "Pyraflufen Ethyl"
+hrac[hrac$compound == "Pyrithiobac-Na", "compound"] <- "Pyrithiobac-Sodium"
+hrac[hrac$compound == "Quizalofop-P-Ethyl", "compound"] <- "Quizalofop"
+hrac[hrac$compound == "Sulfometuron-Methyl", "compound"] <- "Sulfometuron"
+hrac[hrac$compound == "Terbutryne", "compound"] <- "Terbutryn"
+hrac[hrac$compound == "Thifensulfuron-Methyl", "compound"] <- "Thifensulfuron"
+hrac[hrac$compound == "Thiobencarb = Benthiocarb", "compound"] <- "Thiobencarb"
+hrac[hrac$compound == "Triallate", "compound"] <- "Tri-Allate"
+hrac[hrac$compound == "Tribenuron-Methyl", "compound"] <- "Tribenuron Methyl"
+hrac[hrac$compound == "Triflusulfuron-Methyl", "compound"] <- "Triflusulfuron"
+```
+
+http://cru66.cahe.wsu.edu/labels/Dictionaries.php?dictionary=INGR
+
+Additional info from:
+https://sitem.herts.ac.uk/aeru/ppdb/en/index.htm
+
+
+```{r, rac}
+# Read in RAC codes for pesticide list
+rac <- "http://cru66.cahe.wsu.edu/labels/Dictionaries.php?dictionary=INGR" %>% 
+  read_html() %>% 
+  html_nodes("table") %>% 
+  .[2] %>% 
+  html_table(header = TRUE, fill = TRUE) %>% 
+  .[[1]] %>% 
+  transmute(compound = gsub(" \\(.*\\)", "", str_to_title(Name)),
+            rac_type = `Resistance Source`,
+            rac_code = `Resistance Code`) %>% 
+  mutate(compound = gsub(" -Historical Tol Code-", "", compound))
+
+# Work read in
+rac <- read_csv("./Pesticide Class/RAC WSU.csv") %>% 
+  transmute(compound = gsub(" \\(.*\\)", "", str_to_title(Name)),
+            rac_type = `Resistance Source`,
+            rac_code = `Resistance Code`) %>% 
+  mutate(compound = gsub(" -Historical Tol Code-", "", compound))
+
+# rename select pesticides to match USGS epest names
+rac[rac$compound == "Acibenzolar-S-Methyl", "compound"] <- "Acibenzolar"
+rac[rac$compound == "Acifluorfen, Sodium Salt", "compound"] <- "Acifluorfen"
+rac[rac$compound == "Alpha-Cypermethrin", "compound"] <- "Alpha Cypermethrin"
+rac[rac$compound == "Ametoctradin", "compound"] <- "Amectoctradin"
+rac[rac$compound == "Ametryne", "compound"] <- "Ametryn"
+rac[rac$compound == "Bacillus Amyloliquefaciens, Strain F727", "compound"] <- 
+  "Bacillus Amyloliquifacien"
+rac[rac$compound == "Bacillus Mycoides, Isolate J", "compound"] <- "Bacillus Mycoides"
+rac[rac$compound == "Bacillus Subtilis, Strain Gb03", "compound"] <- "Bacillus Subtilis"
+rac[rac$compound == "Bacillus Thuringiensis Endotoxins", "compound"] <- "Bacillus Thuringiensis"
+rac[rac$compound == "Benefin", "compound"] <- "Benfluralin"
+rac[rac$compound == "Bentazon", "compound"] <- "Bentazone"
+rac[rac$compound == "Benzovindiflupyr", "compound"] <- "Benzovidiflupyr"
+rac[rac$compound == "Bispyribac-Sodium", "compound"] <- "Bispyribac"
+rac[rac$compound == "Blad", "compound"] <- "Blad Protein"
+rac[rac$compound == "Chlorimuron-Ethyl", "compound"] <- "Chlorimuron"
+rac[rac$compound == "Clodinafop-Propargyl", "compound"] <- "Clodinafop"
+rac[rac$compound == "Copper As Elemental", "compound"] <- "Copper"
+rac[rac$compound == "Cyhalothrin, Gamma", "compound"] <- "Cyhalothrin-Gamma"
+rac[rac$compound == "Diclofop-Methyl", "compound"] <- "Diclofop"
+rac[rac$compound == "Diflufenzopyr - Sodium", "compound"] <- "Diflufenzopyr"
+rac[rac$compound == "Emamectin Benzoate", "compound"] <- "Emamectin"
+rac[rac$compound == "Endothall", "compound"] <- "Endothal"
+rac[rac$compound == "Fenbutatin-Oxide", "compound"] <- "Fenbutatin Oxide"
+rac[rac$compound == "Fenoxaprop-P-Ethyl", "compound"] <- "Fenoxaprop"
+rac[rac$compound == "Fluazifop-P-Butyl", "compound"] <- "Fluazifop"
+rac[rac$compound == "Flucarbazone-Sodium", "compound"] <- "Flucarbazone"
+rac[rac$compound == "Flumiclorac, Pentyl Ester", "compound"] <- "Flumiclorac"
+rac[rac$compound == "Formetanate Hydrochloride", "compound"] <- "Formetanate"
+rac[rac$compound == "Fosamine Ammonium", "compound"] <- "Fosamine"
+rac[rac$compound == "Fosetyl Al", "compound"] <- "Fosetyl"
+rac[rac$compound == "Glufosinate-Ammonium", "compound"] <- "Glufosinate"
+rac[rac$compound == "Halauxifen-Methyl", "compound"] <- "Halauxifen"
+rac[rac$compound == "Halosulfuron-Methyl", "compound"] <- "Halosulfuron"
+rac[rac$compound == "Imazamethabenz-Methyl", "compound"] <- "Imazamethabenz"
+rac[rac$compound == "Iodosulfuron-Methyl-Sodium", "compound"] <- "Iodosulfuron"
+rac[rac$compound == "Mesosulfuron-Methyl", "compound"] <- "Mesosulfuron"
+rac[rac$compound == "Metsulfuron-Methyl", "compound"] <- "Metsulfuron"
+rac[rac$compound == "Oxydemeton Methyl", "compound"] <- "Oxydemeton-Methyl"
+rac[rac$compound == "Primisulfuron-Methyl", "compound"] <- "Primisulfuron"
+rac[rac$compound == "Propamocarb Hydrochloride", "compound"] <- "Propamocarb Hcl"
+rac[rac$compound == "Propoxycarbazone-Sodium", "compound"] <- "Propoxycarbazone"
+rac[rac$compound == "Pyraflufen-Ethyl", "compound"] <- "Pyraflufen Ethyl"
+rac[rac$compound == "Quizalofop-P Ethyl", "compound"] <- "Quizalofop"
+rac[rac$compound == "Spinosad", "compound"] <- "Spinosyn"
+rac[rac$compound == "Sulfometuron-Methyl", "compound"] <- "Sulfometuron"
+rac[rac$compound == "Terbutryne", "compound"] <- "Terbutryn"
+rac[rac$compound == "Thifensulfuron-Methyl", "compound"] <- "Thifensulfuron"
+rac[rac$compound == "Thiophanate Methyl", "compound"] <- "Thiophanate-Methyl"
+rac[rac$compound == "Triallate", "compound"] <- "Tri-Allate"
+rac[rac$compound == "Tribenuron-Methyl", "compound"] <- "Tribenuron Methyl"
+rac[rac$compound == "Triflusulfuron-Methyl", "compound"] <- "Triflusulfuron"
+rac[rac$compound == "Tau-Fluvalinate", "compound"] <- "Fluvalinate-Tau"
+rac[rac$compound == "Lime Sulfur - Calcium Polysulfide", "compound"] <- "Calcium Polysulfide"
+rac[rac$compound == "Pyrazon", "compound"] <- "Chloridazon"
+rac[rac$compound == "Copper Sulfate Anhydrous", "compound"] <- "Copper Sulfate"
+rac[rac$compound == "Copper Sulfate Basic", "compound"] <- "Copper Sulfate Tribasic"
+rac[rac$compound == "2,4-Dp", "compound"] <- "Dichlorprop"
+rac[rac$compound == "Dcna", "compound"] <- "Dicloran"
+rac[rac$compound == "Ethoprop", "compound"] <- "Ethoprophos"
+rac[rac$compound == "Polyoxin D Zinc Salt", "compound"] <- "Polyoxorim"
+rac[rac$compound == "Pcnb", "compound"] <- "Quintozene"
+
+# Include additional pesticides
+rac <- rbind(rac, c("Amitrole", "HRAC", "F3"), 
+             c("Barium Polysulfide", "FRAC", "NC"),
+             c("Bensulfuron", "HRAC", "B"), 
+             c("Bifenox", "HRAC", "E"),
+             c("Bordeaux Mixture", "FRAC", "M1"), 
+             c("Chinomethionat", "FRAC", "M10"),
+             c("Chloramben", "HRAC", "O"), 
+             c("Chlordimeform", "IRAC", "NC"),
+             c("Ammonium Sulfamate", "HRAC", "NC"), 
+             c("Copper Oxychloride S", "FRAC", "M1"),
+             c("Cuprous Oxide", "FRAC", "M1"),
+             c("Cyhalofop", "HRAC", "A"),
+             c("Cyhalothrin-Lambda", "IRAC", "3"),
+             c("Dalapon", "HRAC", "N"),
+             c("Di-Allate", "HRAC", "N"),
+             c("Diclosulam", "HRAC", "B"),
+             c("Dienochlor", "IRAC", "2A"),
+             c("Diethatyl", "HRAC", "K3"),
+             c("Dimethenamid & Dimethenamid-P", "HRAC", "K3"),
+             c("Dimethyl Disulfide", "IRAC", "NC"),
+             c("Dinoseb", "HRAC", "M"),
+             c("Dnoc", "HRAC", "M"),
+             c("Dsma", "HRAC", "NC"),
+             c("Epn", "IRAC", "1B"),
+             c("Fensulfothion", "IRAC", "1B"),
+             c("Fentin", "FRAC", "30"),
+             c("Flucythrinate", "IRAC", "3"),
+             c("Fluometuron", "HRAC", "C2/F3"),
+             c("Flusilazole", "FRAC", "3"),
+             c("Fluvalinate", "IRAC", "3"),
+             c("Gallex", "FRAC", "NC"), 
+             c("Gamma Aminobutyric Acid", "FRAC", "NC"),
+             c("Garlic Juice", "IRAC", "NC"), 
+             c("Gentamicin Sulfate", "FRAC", "NC"),
+             c("Hydrated Lime", "IRAC", "NC"),
+             c("Isazofos", "IRAC", "1B"),
+             c("Isopropalin", "HRAC", "NC"),
+             c("Kaolin Clay", "IRAC", "NC"),
+             c("Kinoprene", "IRAC", "7A"),
+             c("Lead Arsenate", "IRAC", "NC"),
+             c("Mecoprop", "HRAC", "O"),
+             c("Metam", "HRAC", "Z"),
+             c("Metam Potassium", "HRAC", "Z"),
+             c("Methyl Iodide", "IRAC", "NC"),
+             c("Metolachlor-S", "HRAC", "K3"),
+             c("Metolachlor & Metolachlor-S", "HRAC", "K3"),
+             c("Molinate", "HRAC", "N"),
+             c("Naptha", "HRAC", "NC"),
+             c("Noruron", "HRAC", "NC"),
+             c("Orthosulfamuron", "HRAC", "NC"),
+             c("Petroleum Distillate", "FRAC", "NC"),
+             c("Petroleum Oil", "FRAC", "NC"),
+             c("Pinolene", "Adjuvant", "NC"),
+             c("Potassium Carbonate", "FRAC", "NC"),
+             c("Profenofos", "IRAC", "1B"),
+             c("Profluralin", "HRAC", "NC"),
+             c("Propyzamide", "HRAC", "K1"),
+             c("Pyrithiobac-Sodium", "HRAC", "B"),
+             c("Ryanodine", "IRAC", "28"),
+             c("Sabadilla", "IRAC", "NC"), 
+             c("Silicates", "FRAC", "NC"),
+             c("Sodium Arsenite", "HRAC", "NC"),
+             c("Sulfallate", "HRAC", "N"),
+             c("Tca", "HRAC", "N"),
+             c("Tebupirimphos", "IRAC", "1B"),
+             c("Tetraborohydrate", "IRAC", "NC"),
+             c("Tetrathiocarbonate", "FRAC", "NC"),
+             c("Thidiazuron", "HRAC", "E"),
+             c("Thiobencarb", "HRAC", "N"),
+             c("Tribufos", "HRAC", "NC"),
+             c("Tridiphane", "HRAC", "NC"),
+             c("Trifloxysulfuron", "HRAC", "B"),
+             c("Trimethacarb", "IRAC", "1A"),
+             c("Burkholderia Cepacia", "IRAC", "UNB"),
+             c("Burkholderia Spp", "IRAC", "UNB"),
+             c("Chenopodium Ambrosioides", "IRAC", "UNE"),
+             c("Beauveria Bassiana", "IRAC", "UNF"),
+             c("Ampelomyces Quisqualis", "FRAC", "NC"),
+             c("Aspergillus Flavus", "FRAC", "NC"),
+             c("Aureobasidium Pullulans", "FRAC", "NC"),
+             c("Bacillus Firmus", "IRAC", "NC"),
+             c("Bacillus Pumilis", "FRAC", "NC"),
+             c("Bacteriophage", "FRAC", "NC"),
+             c("Chromobacterium Subtsugae", "IRAC", "NC"),
+             c("Collectotrichum Spores", "HRAC", "NC"),
+             c("Coniothyrium Minitans", "FRAC", "NC"),
+             c("Cydia Pomonella", "IRAC", "NC"),
+             c("Gliocladium Virens", "FRAC", "NC"), 
+             c("Isaria Fumosorosea", "IRAC", "NC"),
+             c("Myrothecium Verrucaria", "IRAC", "NC"),
+             c("Nosema Locustae Cann", "IRAC", "NC"),
+             c("Paecilomyces Lilacinus", "IRAC", "NC"),
+             c("Phytophthora Spores", "HRAC", "NC"),
+             c("Polyhedrosis Virus", "IRAC", "NC"),
+             c("Pseudomonas Fluorescens", "FRAC", "NC"),
+             c("Steinernema Carpocap", "IRAC", "NC"),
+             c("Steinernema Riobravi", "IRAC", "NC"),
+             c("Streptomyces Lydicus", "FRAC", "NC"))
+
+# Add missing RAC information 
+rac[rac$compound == "Allyl Isothiocyanate", 2:3] <- c("IRAC", "NC")
+rac[rac$compound == "Barban", 2:3] <- c("HRAC", "NC")
+rac[rac$compound == "Bendiocarb", 2:3] <- c("IRAC", "1A")
+rac[rac$compound == "Carbophenothion", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Chlorobenzilate", 2:3] <- c("IRAC", "2A")
+rac[rac$compound == "Cinnamaldehyde", 2:3] <- c("IRAC", "NC")
+rac[rac$compound == "Demeton", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Dichlone", 2:3] <- c("FRAC", "NC")
+rac[rac$compound == "Dichloropropene", 2:3] <- c("IRAC", "NC")
+rac[rac$compound == "Ethion", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Fluchloralin", 2:3] <- c("HRAC", "NC")
+rac[rac$compound == "Fluensulfone", 2:3] <- c("IRAC", "NC")
+rac[rac$compound == "Fonofos", 2:3] <- c("IRAC", "NC")
+rac[rac$compound == "Harpin Protein", 2:3] <- c("FRAC", "NC")
+rac[rac$compound == "Hydrogen Peroxide", 2:3] <- c("FRAC", "NC")
+rac[rac$compound == "Isofenphos", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Lindane", 2:3] <- c("IRAC", "2A")
+rac[rac$compound == "Metaldehyde", 2:3] <- c("Molluscicide", "NC")
+rac[rac$compound == "Methazole", 2:3] <- c("HRAC", "Z")
+rac[rac$compound == "Methyl Isothiocyanate", 2:3] <- c("FRAC", "NC")
+rac[rac$compound == "Mevinphos", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Monocrotophos", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Neem Oil", 2:3] <- c("IRAC", "UNE")
+rac[rac$compound == "Phosalone", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Phosphamidon", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Phosphoric Acid", 2:3] <- c("FRAC", "33")
+rac[rac$compound == "Piperonyl Butoxide", 2:3] <- c("Adjuvant", "NC")
+rac[rac$compound == "Potassium Oleate", 2:3] <- c("IRAC", "NC")
+rac[rac$compound == "Potassium Silicate", 2:3] <- c("FRAC", "NC")
+rac[rac$compound == "Saflufenacil", 2:3] <- c("HRAC", "E")
+rac[rac$compound == "Sodium Chlorate", 2:3] <- c("HRAC", "NC")
+rac[rac$compound == "Sodium Metaborate", 2:3] <- c("HRAC", "NC")
+rac[rac$compound == "Spinetoram", 2:3] <- c("IRAC", "5")
+rac[rac$compound == "Sucrose Octanoate", 2:3] <- c("IRAC", "NC")
+rac[rac$compound == "Sulfur", 2:3] <- c("FRAC", "M2")
+rac[rac$compound == "Sulfuric Acid", 2:3] <- c("HRAC", "NC")
+rac[rac$compound == "Sulprofos", 2:3] <- c("IRAC", "1B")
+rac[rac$compound == "Triazamate", 2:3] <- c("IRAC", "1A")
+rac[rac$compound == "Zinc", 2:3] <- c("FRAC", "NC")
+```
+
+
+```{r}
+# Vector of Plant Growth Regulators
+pgr <- tibble(compound = c("1-Methyl Cyclopropene", "Chlormequat", "Cytokinin", 
+                           "Daminozide", "Ethephon", "Gibberellic Acid", 
+                           "Indolyl-Butyric Acid", "Maleic Hydrazide", "Mefluidide", 
+                           "Mepiquat", "Decan-1-Ol", "Paclobutrazol", "Prohexadione", 
+                           "Trinexapac", "Uniconazole", "Naphthylacetamide", 
+                           "Naphthylacetic Acid", "6-Benzyladenine", "Abscisic Acid",
+                           "Aviglycine", "Arsenic Acid", "Calcium Chloride", "Cppu",
+                           "Cyanamide", "Cyclanilide", "Dimethipin",
+                           "Dimethylarsinic Acid", "Fatty Alcohols", "Flumetralin",
+                           "Hydroxypropanoic Acid", "Iba", "L-Glutamic Acid",
+                           "Prohydrojasmon", "Sulfcarbamide", "Tetraoxosulfate", 
+                           "Bacillus Cereus")) %>% 
+  mutate(pgr = TRUE)
+
+unique_epest <- tibble(compound = unique(epest_state$compound)) %>% 
+  left_join(rac, by = "compound") %>% 
+  left_join(pgr, by = "compound")
+
+b <- unique_epest %>% 
+  filter(is.na(rac_code), is.na(pgr)) 
+```
+
+
+Cropland Data Layer (CDL) was obtained fromthe USDA National Agricultural Statistics Service. [link](https://www.nass.usda.gov/Research_and_Science/Cropland/sarsfaqs2.php#Section1_10.0)
+
+```{r, cdl}
+read_cdl <- function(yr) {
+  path <- paste0("./CDL/CropScape_", yr, "_Stats.xlsx")
+  
+  path %>% 
+    excel_sheets() %>% 
+    set_names() %>% 
+    map_df(~ read_xlsx(path = path, sheet = .x, range = cell_cols("A:D")),
+         .id = "state") %>% 
+    rename(category = Category, acreage = Acreage) %>% 
+    filter(!is.na(category), 
+           Value != 64,        # Remove unused Shrubland(64) category
+           Value != 65) %>%   # Remove unused Barren(65) category
+    select(state, category, acreage) %>% 
+    mutate(year = yr, state = tolower(state))
+}
+
+cdl <- bind_rows(lapply(2008:2018, read_cdl))
+
+cdl_zero <- cdl %>%
+  filter(state == "national") %>% 
+  group_by(category) %>% 
+  summarize(acres = sum(acreage)) %>% 
+  filter(acres == 0)
+
+cdl <- filter(cdl, !category %in% cdl_zero$category)
+
+write.csv(cdl, "cdl.csv")
+```
+
+```{r}
+bip <- read_html("https://bip2.beeinformed.org/loss-map/") %>% 
+  html_nodes(xpath = "//*[@id='config']") %>% 
+  html_text() %>% 
+  fromJSON() %>% 
+  .[[2]] %>% 
+  as_tibble()
+
+write.csv(bip, "bip.csv")
+bip <- read_csv("bip.csv")
+```
+

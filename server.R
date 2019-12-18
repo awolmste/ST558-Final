@@ -232,6 +232,7 @@ function(input, output) {
   # Render numerical summaries
   output$epest_natl_table <- renderTable({
     get_epest_natl() %>% 
+      filter(compound %in% input$compounds_natl) %>% 
       arrange(-total_mass) %>% 
       select(compound, min_mass, med_mass, avg_mass, max_mass)
   })
